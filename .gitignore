@@ -1,0 +1,51 @@
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtualenv ----
+venv/
+.venv/
+ENV/
+env/
+
+# ---- Packaging / build ----
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- Tests / coverage ----
+.pytest_cache/
+.coverage*
+htmlcov/
+coverage.xml
+
+# ---- Logs / runtime ----
+*.log
+*.pid
+*.sock
+
+# ---- Env / secrets ----
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
+*.csr
+
+# ---- IDEs ----
+.vscode/
+.idea/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Local backups / scratch ----
+_local_backup/
+*prednekonecnem*
+*.tar
+*.tgz
+
