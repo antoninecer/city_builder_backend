@@ -58,6 +58,12 @@ end
 class ExpandGemsRequest(BaseModel):
     steps: int = 1
 
+class CreditGemsRequest(BaseModel):
+    user_id: str
+    gems: int
+    provider: str = "dev"
+    purchase_id: Optional[str] = None
+
 def _ledger_key(user_id: str) -> str:
     return f"ledger:{user_id}"
 
@@ -1098,6 +1104,72 @@ async def expand_world(req: Request, user_id: str, body: ExpandRequest):
         "unlimited": bool(_is_unlimited()),
     }
 
+ENABLE_SHOP_ENDPOINTS = os.getenv("ENABLE_SHOP_ENDPOINTS", "0") == "1"
+
+@app.post("/shop/credit_gems")
+async def shop_credit_gems(req: Request, body: CreditGemsRequest):
+    # safety: zatím vypnuté, dokud to nehlídá auth / feature flag
+    if not ENABLE_SHOP_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    now = time.time()
+
+    idem = (req.headers.get("Idempotency-Key") or "").strip()
+    if not idem:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+
+    if body.gems <= 0:
+        raise HTTPException(status_code=400, detail="gems must be > 0")
+
+    user_id = body.user_id
+    player_key = _player_key(user_id)
+
+    async with UserLock(user_id):
+        # idempotency check
+        idk = _idempo_key(user_id, "credit_gems", idem)
+        existing = await redis_client.get(idk)
+        if existing:
+            try:
+                return json.loads(existing)
+            except Exception:
+                pass
+
+        resources_raw = await redis_client.hgetall(player_key)
+        if not resources_raw:
+            raise HTTPException(status_code=404, detail="Player not found")
+
+        cur_gems = _safe_int(resources_raw.get("gems"), 0)
+        new_gems = cur_gems + int(body.gems)
+
+        entry = {
+            "id": uuid.uuid4().hex,
+            "type": "credit",
+            "reason": "purchase_gems",
+            "delta": {"gems": int(body.gems)},
+            "meta": {
+                "provider": body.provider,
+                "purchase_id": body.purchase_id,
+                "idempotency_key": idem,
+            },
+            "ts": now,
+        }
+
+        resp = {
+            "message": "Gems credited",
+            "user_id": user_id,
+            "gems_added": int(body.gems),
+            "gems": int(new_gems),
+            "server_time": now,
+        }
+
+        pipe = redis_client.pipeline(transaction=True)
+        pipe.hset(player_key, mapping={"gems": new_gems})
+        pipe.lpush(_ledger_key(user_id), json.dumps(entry))
+        pipe.ltrim(_ledger_key(user_id), 0, 999)
+        pipe.set(idk, json.dumps(resp), ex=60 * 60 * 24 * 7)
+        await pipe.execute()
+
+    return resp
 
 # =============================================================================
 # === DEV ENDPOINTS ===========================================================

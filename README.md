@@ -1,34 +1,43 @@
-# City Builder Backend — Development README
+# City Builder Backend — Dev README (Contract + Roadmap)
 
-Backend for an isometric, tile-based city builder with expandable world, dev-friendly debugging, and future-ready monetization primitives.
-
-> Code is in English. This README is the shared contract for frontend/backend while we iterate fast.
-
----
-
-## Overview
-
-This backend is designed to:
-- store buildings in **world coordinates** centered around `(0,0)`
-- support **world expansion in rings** (+1 radius per expansion)
-- remain production-safe (locking, controlled DEV endpoints)
-- be ready for future monetization (gems, speed-ups, paid expansion) without schema rewrites
+Backend for an isometric, tile-based city builder.
+Redis is the source of truth. Code in English. This README is the FE/BE contract.
 
 ---
 
-## Core World Model
+## 0) Status (today)
+
+**Working now:**
+- World is centered at `(0,0)` with **radius-based bounds** (default `radius=3` ⇒ `7×7`).
+- Buildings are stored in **world tile coordinates** (negative coords allowed).
+- Placement uses **footprint-aware collision + bounds checks** (ready for 2×1, 2×2…).
+- `rotation` is stored (currently not affecting geometry).
+- Player resources include **gold, wood, gems, last_collect**.
+- `GET /city/{user_id}` returns a **catalog** (FE does not hardcode building config).
+- Monetization primitive exists: **expand world by spending gems** with:
+  - `Idempotency-Key`
+  - immutable-ish **ledger entry**
+  - atomic Redis `MULTI/EXEC` (pipeline `transaction=True`)
+  - all under **per-user lock**.
+
+**Safety note (today):**
+- `POST /city/{user_id}/expand_gems` is currently gated by `ALLOW_DEV_ENDPOINTS` for testing.
+  - For v1.0 monetization: move this behind a proper feature flag / auth (see roadmap).
+
+---
+
+## 1) Core world model
 
 ### Coordinates
-- All buildings use **WORLD tile coordinates** `(x, y)`.
-- `(0,0)` is the **center** (starting townhall position).
-- Default starting world:
-  - `radius = 3`
-  - bounds: `x ∈ [-3..3]`, `y ∈ [-3..3]`
-  - grid: `7×7`
+- Buildings use WORLD tile coordinates `(x,y)`.
+- `(0,0)` is the center (Townhall start).
 
-### World metadata returned by API
-`GET /city/{user_id}` returns:
+Default world:
+- `radius = 3`
+- bounds: `x ∈ [-3..3]`, `y ∈ [-3..3]`
+- grid: `7×7`
 
+### World payload (GET /city/{user_id})
 ```json
 "world": {
   "radius": 3,
@@ -36,65 +45,45 @@ This backend is designed to:
   "bounds": {"min_x": -3, "max_x": 3, "min_y": -3, "max_y": 3},
   "anchor": "topleft"
 }
-Expansion
-Expansion happens in rings.
-
-One expansion step = +1 radius → adds one row/column on each side.
-
-Area grows quadratically with radius.
-
-Current endpoint:
-
-POST /city/{user_id}/expand with JSON body { "steps": 1 } (default 1)
-
-Pricing model (future): cost should grow faster than linear (exponential / polynomial).
-Backend already exposes the primitive; later we’ll bind it to gems / payments.
-
-Buildings
-Building record (current API shape)
-Each building in buildings contains:
-
+2) Buildings
+Building record returned by API
 json
 Copy code
 {
-  "type": "townhall",
+  "type": "farm",
   "level": 1,
-  "x": 0,
+  "x": 1,
   "y": 0,
   "upgrade_start": null,
   "upgrade_end": null,
-  "rotation": null
+  "rotation": 0,
+  "footprint": {"w": 1, "h": 1}
 }
-Footprint & Rotation (future-ready)
-Backend already has footprint + rotatable in server config.
+Footprint + rotation rules
+Server config (BUILDING_CONFIG) defines:
 
-Current implementation:
+footprint {w,h}
 
-all buildings are 1×1
+rotatable
 
-rotation is accepted/stored but currently not used for geometry
+Placement already validates:
 
-Planned:
+all footprint tiles are inside bounds
 
-footprints like 2×1, 2×2, 3×1, 4 tiles total
+none collide with existing buildings
 
-rotation 0/90/180/270 swaps width/height for rectangular buildings
+Rotation is stored but geometry is currently treated as unrotated.
+Next: apply rotation transform (swap w/h for 90/270 when rotatable).
 
-placement checks will validate:
-
-all covered tiles are in bounds
-
-all covered tiles are free (collision by footprint)
-
-Townhall rule
-Exactly one townhall.
+Townhall rules
+Exactly one townhall_0.
 
 Cannot be demolished.
 
-Reset always recreates only townhall at (0,0).
+Reset recreates townhall at (0,0).
 
-Player State
-Resources (current)
+3) Player state + lazy progress
+Player resources (Redis)
 Stored in Redis hash player:{user_id}:
 
 json
@@ -102,59 +91,19 @@ Copy code
 {
   "gold": number,
   "wood": number,
+  "gems": number,
   "last_collect": timestamp
 }
-Gems (planned)
-We will add:
+Lazy progress on GET /city/{user_id}
+finishes upgrades when upgrade_end <= now
 
-json
-Copy code
-"gems": number
-as premium currency for microtransactions.
+applies idle production since last_collect (unless unlimited dev mode)
 
-Lazy Progress Model
-GET /city/{user_id} also performs:
+updates last_collect
 
-finishing upgrades when upgrade_end <= now
+all protected by per-user lock
 
-applying idle production since last_collect (unless unlimited dev mode is enabled)
-
-updating last_collect
-
-All under a per-user Redis lock to prevent race conditions.
-
-Development Mode
-Why
-We don’t want to wait hours/days for resources during UI iteration and gameplay experiments.
-
-Enable Dev Mode
-bash
-Copy code
-export ALLOW_DEV_ENDPOINTS=1
-export DEV_UNLIMITED_RESOURCES=1
-# optional:
-export DEV_DEFAULT_GOLD=99999999
-export DEV_DEFAULT_WOOD=99999999
-export DEFAULT_WORLD_RADIUS=3
-
-# restart backend after setting env vars
-Unlimited Resources Mode
-When DEV_UNLIMITED_RESOURCES=1:
-
-gold/wood costs are not deducted
-
-validation still runs (bounds, collisions, etc.)
-
-ideal for placement/UI iteration and footprint experiments
-
-DEV endpoint safety
-DEV endpoints are disabled by default.
-
-If ALLOW_DEV_ENDPOINTS is not set, dev endpoints should be unavailable.
-
-In production: keep disabled or add auth/IP allowlist.
-
-API Summary (curl)
+4) API (core)
 Health
 bash
 Copy code
@@ -174,165 +123,205 @@ bash
 Copy code
 curl -s -X POST http://localhost:8002/city/test123/place \
   -H 'Content-Type: application/json' \
-  -d '{"building_type":"farm","x":1,"y":0}'
-Upgrade building
+  -d '{"building_type":"farm","x":1,"y":0,"rotation":0}'
+Upgrade / demolish
 bash
 Copy code
 curl -s -X POST http://localhost:8002/city/test123/upgrade \
   -H 'Content-Type: application/json' \
   -d '{"building_id":"farm_123"}'
-Demolish building
-bash
-Copy code
+
 curl -s -X POST http://localhost:8002/city/test123/demolish \
   -H 'Content-Type: application/json' \
   -d '{"building_id":"farm_123"}'
-Expand world (+1 ring)
+Expand world (gold primitive)
 bash
 Copy code
 curl -s -X POST http://localhost:8002/city/test123/expand \
   -H 'Content-Type: application/json' \
   -d '{"steps":1}'
-DEV Endpoints (curl)
-Reset player (townhall-only)
-Resets player state:
+5) Monetization primitives (v0.x)
+A) Spend gems → expand world
+Endpoint:
 
-resources reset (or huge if unlimited)
+POST /city/{user_id}/expand_gems
 
-buildings cleared
+requires header: Idempotency-Key: <unique>
 
-only townhall_0 at (0,0)
+Behavior:
 
-world radius back to default (DEFAULT_WORLD_RADIUS)
+spends gems
+
+expands radius
+
+writes ledger entry to ledger:{user_id}
+
+stores exact response to idempo:{user_id}:expand_gems:<key> (TTL 7 days)
+
+atomic Redis transaction (MULTI/EXEC) + per-user lock
+
+Example:
 
 bash
 Copy code
+IDEM="expand-123"
+curl -s -X POST http://localhost:8002/city/test123/expand_gems \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ${IDEM}" \
+  -d '{"steps":1}'
+Ledger inspection:
+
+bash
+Copy code
+redis-cli LRANGE "ledger:test123" 0 10
+6) Development mode
+Enable:
+
+bash
+Copy code
+export ALLOW_DEV_ENDPOINTS=1
+export DEV_UNLIMITED_RESOURCES=1
+# optional:
+export DEV_DEFAULT_GOLD=99999999
+export DEV_DEFAULT_WOOD=99999999
+export DEV_DEFAULT_GEMS=999999
+export DEFAULT_WORLD_RADIUS=3
+# restart backend
+Rules:
+
+DEV_UNLIMITED_RESOURCES=1 ⇒ gold/wood not deducted, but validation still runs.
+
+DEV endpoints disabled by default.
+
+DEV endpoints:
+
+bash
+Copy code
+# reset (townhall-only)
 curl -s -X POST http://localhost:8002/dev/reset/test123 \
   -H 'Content-Type: application/json' \
   -d '{"wipe": true}'
-Grant resources (debug)
-Canonical endpoint:
 
-bash
-Copy code
+# grant resources (including gems)
 curl -s -X POST http://localhost:8002/dev/grant/test123 \
   -H 'Content-Type: application/json' \
-  -d '{"gold":100000,"wood":100000,"mode":"add"}'
-Alias for convenience/scripts:
+  -d '{"gold":100000,"wood":100000,"gems":1000,"mode":"set"}'
 
-bash
-Copy code
-curl -s -X POST http://localhost:8002/dev/resources/test123 \
-  -H 'Content-Type: application/json' \
-  -d '{"gold":100000,"wood":100000,"mode":"set"}'
-Wipe player (delete keys, no recreate)
-bash
-Copy code
+# wipe user
 curl -s -X POST http://localhost:8002/dev/wipe/test123
-Set world radius directly (DEV)
-Accepts either JSON body or query param:
+7) Roadmap (versions, minimal ballast)
+v0.4 — FE contract stable (next)
+Goal: smooth frontend work without refactors.
+
+Apply rotation to footprints (swap w/h for 90/270 when rotatable).
+
+Add 1–2 real footprint buildings (e.g. warehouse 2×2, longhouse 2×1).
+
+Ensure catalog fully describes build menu (costs, footprint, rotatable, max_level).
+
+v0.5 — Monetization primitives pack
+Goal: same spend pattern reused everywhere.
+
+Add speed-up primitive (spend gems):
+
+POST /city/{user_id}/speedup_upgrade
+
+modes:
+
+finish instantly
+
+reduce remaining time by X seconds
+
+idempotency + ledger + atomic transaction + lock (same pattern as expand_gems)
+
+v1.0 — Monetization fast launch (small but real)
+Goal: earn money ASAP with minimal scope.
+
+Gems top-up (server-side stub + later Stripe/App stores):
+
+POST /shop/credit_gems (idempotent, ledger “credit”)
+
+for launch you can gate it + simulate provider
+
+Spend gems:
+
+expand world (already done)
+
+speed-up upgrades (from v0.5)
+
+Move spend endpoints out of DEV:
+
+replace ALLOW_DEV_ENDPOINTS gating with:
+
+ENABLE_SPEND_ENDPOINTS=1 feature flag
+
+later auth/token
+
+Definition of done v1.0:
+
+credit gems → spend gems (expand/speedup) works end-to-end
+
+ledger contains credits + spends
+
+idempotency prevents double-charges
+
+v1.1+ (after revenue signal)
+Better economy balancing (rates, costs, caps, sinks)
+
+Premium-only cosmetics (skins, decorations) (cheap to build, high perceived value)
+
+“Boosters” (time-limited production multipliers) via gems (ledger + idempo)
+
+Simple “events” framework (daily bonuses, limited-time offers)
+
+8) Ops: running 2 backend instances
+You can run multiple backend instances against one Redis:
+
+Redis is the source of truth
+
+per-user lock prevents concurrent writes for the same player
+
+lock TTL prevents deadlocks if one instance dies mid-request
+
+Example:
 
 bash
 Copy code
-# JSON body
-curl -s -X POST http://localhost:8002/dev/world/set_radius/test123 \
-  -H 'Content-Type: application/json' \
-  -d '{"radius":3}'
+uvicorn app.main:app --host 0.0.0.0 --port 8002
+uvicorn app.main:app --host 0.0.0.0 --port 8003
+Put a reverse proxy / LB in front → safe.
 
-# OR query param
-curl -s -X POST "http://localhost:8002/dev/world/set_radius/test123?radius=3"
-Testing
-Smoke test script
-We keep a bash script (example bt2.sh) that:
+9) Parking lot (ideas we keep, not implementing now)
+Portals between players’ cities (Nexus/Realm travel)
 
-creates a new game
+Quest hub buildings (tavern → quest board, factions)
 
-reads world radius/bounds/resources
+Multiplayer modes using city as “overworld map”
 
-expands radius by +1
+Auto-upgrade queues (premium slots)
 
-places farms to 4 corners of the expanded world
+Premium buildings / unique production chains
 
-prints final buildings and world summary
-
-(optional) wipes the user at the end
-
-Recommended cleanup after tests:
-
-bash
-Copy code
-curl -s -X POST http://localhost:8002/dev/wipe/<USER_ID>
-Frontend Integration Notes
-World rendering
-Frontend should:
-
-render a grid based on world.bounds / world.radius
-
-treat (0,0) as the logical center
-
-map world coords → screen coords consistently (isometric transform)
-
-later support shifting the viewport
-
-UX / Menu (hamburger)
-Frontend should add a small in-game menu with actions:
-
-Reset game (DEV) → /dev/reset/{user_id}
-
-Wipe user (DEV) → /dev/wipe/{user_id}
-
-Switch user / logout (client-side)
-
-Buy gems (future)
-
-Buy world expansion (future)
-
-Speed-up upgrades (future)
-
-Monetization (Planned / “Gems-ready”)
-Add premium currency (gems)
-Add gems field to player resources in Redis
-
-Return gems from GET /city/{user_id}
-
-DEV grant must support setting gems
-
-Purchase ledger (important)
-To be monetization-safe we need:
-
-a purchase endpoint that verifies receipts (Stripe/App Store/Google Play later)
-
-immutable ledger record:
-
-purchase_id, provider, user_id, amount, gems_granted, timestamp, idempotency_key
-
-Spend gems on
-World expansion (+1 radius per purchase)
-
-Speed-ups:
-
-finish upgrade instantly
-
-reduce remaining time
-
-Future: premium buildings / cosmetics
-
-All spend operations must be under UserLock.
-
-Philosophy
-Backend should never slow down iteration.
-Dev mode exists so frontend/gameplay can evolve quickly, safely, and without hacks.
-
-pgsql
+yaml
 Copy code
 
-Chceš to ještě doplnit o dvě praktické věci, co se budou hodit “zítra”?
-1) **Sekce “Known differences vs spec”** (že `gems` zatím nejsou v API, footprint není v payloadu buildingu, jen v server configu).  
-2) **Krátký “Ops” odstavec**: jak pustit 2 instance backendu nad jedním Redisem + proč lock TTL chrání před paralelními requesty.
+---
 
-Když řekneš jen “jo přidej”, dopíšu to rovnou do toho README textu.
+### Co je “první pro rychlou monetizaci v1.0” podle toho README?
+1) **Credit gems** endpoint (i kdyby zatím jen “simulace nákupu” přes DEV/feature flag) + ledger “credit”  
+2) **Speed-up** endpoint (stejný pattern jako expand_gems)  
+3) Přepnout gating: `ALLOW_DEV_ENDPOINTS` pryč ze spend endpointů → `ENABLE_SPEND_ENDPOINTS=1` (+ později auth)
+
+Když chceš, napíšu ti hned i **minimální specifikaci a přesné endpointy** pro `POST /shop/credit_gems` a `POST /city/{user_id}/speedup_upgrade` tak, aby to bylo konzistentní s tvým `ledger + idempotency` stylem a aby to FE mohlo rovnou napojit.
 ::contentReference[oaicite:0]{index=0}
 
 
+
+
+DEVELOPER MODE
+
+
+
+Thinking
 
 
