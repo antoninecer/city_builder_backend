@@ -55,6 +55,26 @@ else
 end
 """
 
+class ExpandGemsRequest(BaseModel):
+    steps: int = 1
+
+def _ledger_key(user_id: str) -> str:
+    return f"ledger:{user_id}"
+
+def _idempo_key(user_id: str, op: str, key: str) -> str:
+    return f"idempo:{user_id}:{op}:{key}"
+
+def _expand_cost_gems(current_radius: int, steps: int = 1) -> int:
+    # simple non-linear growth, placeholder for monetization tuning
+    base = 10  # radius 3->4
+    r = max(0, int(current_radius))
+    s = max(1, int(steps))
+    total = 0.0
+    for i in range(s):
+        rr = r + i
+        total += base * (1.55 ** max(0, rr - 3))
+    return int(round(total))
+
 
 class UserLock:
     def __init__(self, user_id: str):
@@ -150,6 +170,8 @@ DEV_UNLIMITED_RESOURCES = os.getenv("DEV_UNLIMITED_RESOURCES", "0") == "1"
 # How much to grant on "reset" if unlimited is enabled (still stored, not virtual)
 DEV_DEFAULT_GOLD = float(os.getenv("DEV_DEFAULT_GOLD", "99999999"))
 DEV_DEFAULT_WOOD = float(os.getenv("DEV_DEFAULT_WOOD", "99999999"))
+DEV_DEFAULT_GEMS = int(os.getenv("DEV_DEFAULT_GEMS", "999999"))
+
 
 # Default world radius for a fresh player. radius=3 => 7x7 from -3..+3
 DEFAULT_WORLD_RADIUS = int(os.getenv("DEFAULT_WORLD_RADIUS", "3"))
@@ -213,7 +235,31 @@ BUILDING_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_RESOURCES = {"gold": 500.0, "wood": 300.0}
+DEFAULT_RESOURCES = {"gold": 500.0, "wood": 300.0, "gems": 0}
+
+def _build_catalog() -> Dict[str, Any]:
+    """
+    Returns a frontend-friendly catalog derived from BUILDING_CONFIG.
+    FE can render build menu + ghosts without hardcoding server config.
+    """
+    catalog: Dict[str, Any] = {}
+    for b_type, cfg in BUILDING_CONFIG.items():
+        fp = cfg.get("footprint") or {"w": 1, "h": 1}
+
+        # build cost convention: we use "level 2 upgrade cost" as build cost (same as /place)
+        try:
+            build_cost_gold = float(cfg["upgrade_cost_gold"][1])
+        except Exception:
+            build_cost_gold = 100.0
+
+        catalog[b_type] = {
+            "footprint": {"w": int(fp.get("w") or 1), "h": int(fp.get("h") or 1)},
+            "rotatable": bool(cfg.get("rotatable", False)),
+            "max_level": int(cfg.get("max_level") or 1),
+            "build_cost_gold": build_cost_gold,
+        }
+    return catalog
+
 
 
 # =============================================================================
@@ -245,6 +291,7 @@ class NewGameRequest(BaseModel):
 class DevGrantRequest(BaseModel):
     gold: Optional[float] = None
     wood: Optional[float] = None
+    gems: Optional[int] = None
     mode: str = "add"  # "add" or "set"
 
 
@@ -433,9 +480,12 @@ def _normalize_building(building_id: str, b: Dict[str, Any]) -> Dict[str, Any]:
     if out["upgrade_end"] in ("", 0):
         out["upgrade_end"] = None
 
-    # future: rotation
-    if "rotation" not in out:
-        out["rotation"] = None
+    if "rotation" not in out or out["rotation"] is None:
+        out["rotation"] = 0
+    
+    # attach footprint for FE contract (stored per building)
+    fp_w, fp_h = _get_footprint_for_type(b_type)
+    out["footprint"] = {"w": fp_w, "h": fp_h}
 
     return out
 
@@ -557,10 +607,11 @@ async def new_game(req: Request, body: NewGameRequest):
         if exists_player or exists_city:
             raise HTTPException(status_code=409, detail="user_id already exists")
 
+        
         if _is_unlimited():
-            resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "last_collect": now}
+            resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "gems": DEV_DEFAULT_GEMS, "last_collect": now}
         else:
-            resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "last_collect": now}
+            resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "gems": DEFAULT_RESOURCES["gems"], "last_collect": now}
 
         buildings = _default_city_buildings()
         world = _default_world()
@@ -601,22 +652,22 @@ async def get_city(req: Request, user_id: str):
         # init player
         if not resources_raw:
             if _is_unlimited():
-                resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "last_collect": now}
+                resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "gems": DEV_DEFAULT_GEMS, "last_collect": now}
             else:
-                resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "last_collect": now}
+                resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "gems": DEFAULT_RESOURCES["gems"], "last_collect": now}  
             created = True
         else:
             resources = {
                 "gold": _safe_float(resources_raw.get("gold"), DEFAULT_RESOURCES["gold"]),
                 "wood": _safe_float(resources_raw.get("wood"), DEFAULT_RESOURCES["wood"]),
+                "gems": _safe_int(resources_raw.get("gems"), DEFAULT_RESOURCES["gems"]),
                 "last_collect": _safe_float(resources_raw.get("last_collect"), now),
             }
-
-            # if unlimited enabled, optionally keep values "topped up" (non-destructive)
             if _is_unlimited():
                 resources["gold"] = max(float(resources["gold"]), DEV_DEFAULT_GOLD)
                 resources["wood"] = max(float(resources["wood"]), DEV_DEFAULT_WOOD)
-
+                resources["gems"] = max(int(resources["gems"]), DEV_DEFAULT_GEMS)   
+            
         # init city
         if not buildings_raw:
             buildings = _default_city_buildings()
@@ -651,6 +702,7 @@ async def get_city(req: Request, user_id: str):
             mapping={
                 "gold": resources["gold"],
                 "wood": resources["wood"],
+                "gems": resources["gems"],
                 "last_collect": resources["last_collect"],
             },
         )
@@ -680,9 +732,10 @@ async def get_city(req: Request, user_id: str):
 
     return {
         "user_id": user_id,
-        "resources": {"gold": round(float(resources["gold"]), 2), "wood": round(float(resources["wood"]), 2)},
+        "resources": {"gold": round(float(resources["gold"]), 2), "wood": round(float(resources["wood"]), 2), "gems": int(resources["gems"])},
         "buildings": buildings,
         "world": world_payload,
+        "catalog": _build_catalog(),
         "server_time": now,
     }
 
@@ -847,6 +900,8 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
             raise HTTPException(status_code=400, detail="Not enough gold to build")
 
         new_id = f"{building_type}_{int(now * 1000)}"
+        rot = int(rotation) if rotation is not None else 0
+        fp_w, fp_h = _get_footprint_for_type(building_type)
 
         buildings[new_id] = {
             "type": building_type,
@@ -855,7 +910,8 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
             "y": y,
             "upgrade_start": None,
             "upgrade_end": None,
-            "rotation": rotation,
+            "rotation": rot,
+            "footprint": {"w": fp_w, "h": fp_h},
         }
 
         _charge_gold(build_cost_gold, resources)
@@ -1073,9 +1129,9 @@ async def dev_reset(req: Request, user_id: str, body: DevResetRequest):
             await redis_client.delete(world_key)
 
         if _is_unlimited():
-            resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "last_collect": now}
+            resources = {"gold": DEV_DEFAULT_GOLD, "wood": DEV_DEFAULT_WOOD, "gems": DEV_DEFAULT_GEMS, "last_collect": now}
         else:
-            resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "last_collect": now}
+            resources = {"gold": DEFAULT_RESOURCES["gold"], "wood": DEFAULT_RESOURCES["wood"], "gems": DEFAULT_RESOURCES["gems"], "last_collect": now}
 
         buildings = _default_city_buildings()
         world = _default_world()
@@ -1119,22 +1175,28 @@ async def dev_grant(req: Request, user_id: str, body: DevGrantRequest):
 
         cur_gold = _safe_float(resources_raw.get("gold"), 0.0)
         cur_wood = _safe_float(resources_raw.get("wood"), 0.0)
+        cur_gems = _safe_int(resources_raw.get("gems"), 0)
 
         g = body.gold
         w = body.wood
+        gems = body.gems
 
         if mode == "add":
             if g is not None:
                 cur_gold += float(g)
             if w is not None:
                 cur_wood += float(w)
+            if gems is not None:
+                cur_gems += int(gems)
         else:
             if g is not None:
                 cur_gold = float(g)
             if w is not None:
                 cur_wood = float(w)
+            if gems is not None:
+                cur_gems = int(gems)
 
-        await redis_client.hset(player_key, mapping={"gold": cur_gold, "wood": cur_wood})
+        await redis_client.hset(player_key, mapping={"gold": cur_gold, "wood": cur_wood, "gems": cur_gems})
 
     log.info(f"rid={req.state.rid} DEV grant user_id={user_id} mode={mode} gold={body.gold} wood={body.wood}")
     return {
@@ -1142,6 +1204,7 @@ async def dev_grant(req: Request, user_id: str, body: DevGrantRequest):
         "user_id": user_id,
         "gold": round(cur_gold, 2),
         "wood": round(cur_wood, 2),
+        "gems": cur_gems,
         "server_time": now,
     }
 
@@ -1203,3 +1266,81 @@ async def dev_world_set_radius(
 
     log.info(f"rid={req.state.rid} DEV set_radius user_id={user_id} radius={r}")
     return {"status": "ok", "user_id": user_id, "world": world, "server_time": now}
+
+@app.post("/city/{user_id}/expand_gems")
+async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest):
+    if not ALLOW_DEV_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    now = time.time()
+    steps = int(body.steps or 1)
+    if steps < 1:
+        steps = 1
+    if steps > 50:
+        raise HTTPException(status_code=400, detail="Too many steps")
+
+    idem = (req.headers.get("Idempotency-Key") or "").strip()
+    if not idem:
+        raise HTTPException(400, "Idempotency-Key header is required")
+
+    player_key = _player_key(user_id)
+    world_key = _world_key(user_id)
+
+    async with UserLock(user_id):
+        # idempotency check
+        idk = _idempo_key(user_id, "expand_gems", idem)
+        existing = await redis_client.get(idk)
+        if existing:
+            # return the stored response (exactly the same)
+            try:
+                return json.loads(existing)
+            except Exception:
+                # fallthrough (should not happen)
+                pass
+
+        resources_raw = await redis_client.hgetall(player_key)
+        if not resources_raw:
+            raise HTTPException(status_code=404, detail="Player not found")
+
+        world = await _load_world(user_id)
+        r = int(world.get("radius") or DEFAULT_WORLD_RADIUS)
+
+        cur_gems = _safe_int(resources_raw.get("gems"), 0)
+        cost = _expand_cost_gems(r, steps)
+
+        if cur_gems < cost:
+            raise HTTPException(status_code=400, detail=f"Not enough gems to expand (cost {cost})")
+
+        cur_gems -= cost
+        world["radius"] = int(r + steps)
+        world["updated_at"] = now
+
+        # ledger entry
+        entry = {
+            "id": uuid.uuid4().hex,
+            "type": "spend",
+            "reason": "expand_world",
+            "delta": {"gems": -cost},
+            "meta": {"steps": steps, "from_radius": r, "to_radius": int(world["radius"])},
+            "ts": now,
+        }
+
+        # save: resources + world + ledger + idempotency response
+        resp = {
+            "message": f"World expanded by {steps} (gems)",
+            "new_radius": int(world["radius"]),
+            "cost_gems": int(cost),
+            "gems": int(cur_gems),
+            "server_time": now,
+        }
+
+        pipe = redis_client.pipeline(transaction=True)
+        pipe.hset(player_key, mapping={"gems": cur_gems})
+        pipe.set(world_key, json.dumps(world))
+        pipe.lpush(_ledger_key(user_id), json.dumps(entry))
+        pipe.ltrim(_ledger_key(user_id), 0, 999)
+        pipe.set(idk, json.dumps(resp), ex=60 * 60 * 24 * 7)  # keep idempotency 7 days
+        await pipe.execute()
+
+    return resp
+
