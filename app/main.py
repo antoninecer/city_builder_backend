@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+import math
 from typing import Any, Dict, Optional, Tuple, List, Iterable
 
 from fastapi import FastAPI, HTTPException, Request, Body, Query
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 
 from app.redis_client import redis_client, close_redis
 
-
+from typing import Literal
 
 
 # -----------------------------------------------------------------------------
@@ -63,6 +64,21 @@ class CreditGemsRequest(BaseModel):
     gems: int
     provider: str = "dev"
     purchase_id: Optional[str] = None
+
+class SpeedupUpgradeRequest(BaseModel):
+    building_id: str
+    mode: Literal["finish", "reduce"] = "finish"
+    seconds: Optional[int] = None  # required if mode="reduce"
+
+
+def _speedup_cost_gems(reduce_seconds: int) -> int:
+    """
+    Pricing placeholder:
+    - 1 gem per started 5 minutes reduced
+    - minimum 1 gem
+    """
+    rs = max(0, int(reduce_seconds))
+    return max(1, int(math.ceil(rs / 300.0)))
 
 def _ledger_key(user_id: str) -> str:
     return f"ledger:{user_id}"
@@ -1416,3 +1432,128 @@ async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest)
 
     return resp
 
+@app.post("/city/{user_id}/speedup_upgrade")
+async def speedup_upgrade(req: Request, user_id: str, body: SpeedupUpgradeRequest):
+    # pokud to chceš zatím držet jen v DEV režimu (doporučený):
+    if not ALLOW_DEV_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    now = time.time()
+
+    idem = (req.headers.get("Idempotency-Key") or "").strip()
+    if not idem:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+
+    player_key = _player_key(user_id)
+    city_key = _city_key(user_id)
+
+    async with UserLock(user_id):
+        # idempotency
+        idk = _idempo_key(user_id, "speedup_upgrade", idem)
+        existing = await redis_client.get(idk)
+        if existing:
+            try:
+                return json.loads(existing)
+            except Exception:
+                pass
+
+        # load state
+        resources_raw = await redis_client.hgetall(player_key)
+        buildings_raw = await redis_client.get(city_key)
+        if not resources_raw or not buildings_raw:
+            raise HTTPException(status_code=404, detail="Player not found")
+
+        try:
+            buildings_loaded = json.loads(buildings_raw)
+        except Exception:
+            buildings_loaded = {}
+        buildings, _ = _normalize_buildings(buildings_loaded)
+
+        # finish due upgrades first (consistency)
+        _finish_upgrades_if_due(now, buildings)
+
+        bid = body.building_id
+        if bid not in buildings:
+            raise HTTPException(status_code=404, detail="Building not found")
+
+        b = buildings[bid]
+        if b.get("upgrade_end") is None:
+            raise HTTPException(status_code=400, detail="No running upgrade to speed up")
+
+        ue = float(b["upgrade_end"])
+        remaining = ue - now
+        if remaining <= 0:
+            # should not happen because of _finish_upgrades_if_due, but safe
+            _finish_upgrades_if_due(now, buildings)
+            raise HTTPException(status_code=400, detail="No running upgrade to speed up")
+
+        mode = body.mode or "finish"
+        if mode not in ("finish", "reduce"):
+            raise HTTPException(status_code=400, detail="mode must be finish or reduce")
+
+        if mode == "reduce":
+            if body.seconds is None:
+                raise HTTPException(status_code=422, detail="seconds is required for mode=reduce")
+            reduce_sec = max(1, int(body.seconds))
+            reduce_sec = min(reduce_sec, int(math.ceil(remaining)))
+        else:
+            reduce_sec = int(math.ceil(remaining))
+
+        cost = _speedup_cost_gems(reduce_sec)
+
+        cur_gems = _safe_int(resources_raw.get("gems"), 0)
+        if cur_gems < cost:
+            raise HTTPException(status_code=400, detail=f"Not enough gems (cost {cost})")
+
+        # apply speedup
+        from_level = int(b.get("level") or 1)
+        from_ue = float(b["upgrade_end"])
+
+        cur_gems -= cost
+        b["upgrade_end"] = max(now, from_ue - float(reduce_sec))
+
+        # if we pushed it to <= now, finalize immediately
+        _finish_upgrades_if_due(now, buildings)
+        to_level = int(b.get("level") or 1)
+
+        # ledger entry
+        entry = {
+            "id": uuid.uuid4().hex,
+            "type": "spend",
+            "reason": "speedup_upgrade",
+            "delta": {"gems": -int(cost)},
+            "meta": {
+                "building_id": bid,
+                "building_type": b.get("type"),
+                "mode": mode,
+                "reduced_seconds": int(reduce_sec),
+                "remaining_before": float(remaining),
+                "upgrade_end_before": float(from_ue),
+                "upgrade_end_after": float(b.get("upgrade_end") or 0),
+                "from_level": int(from_level),
+                "to_level": int(to_level),
+            },
+            "ts": now,
+        }
+
+        resp = {
+            "message": "Upgrade speedup applied",
+            "building_id": bid,
+            "mode": mode,
+            "reduced_seconds": int(reduce_sec),
+            "cost_gems": int(cost),
+            "gems": int(cur_gems),
+            "new_level": int(to_level),
+            "server_time": now,
+        }
+
+        # atomic save
+        pipe = redis_client.pipeline(transaction=True)
+        pipe.hset(player_key, mapping={"gems": cur_gems})
+        pipe.set(city_key, json.dumps(buildings))
+        pipe.lpush(_ledger_key(user_id), json.dumps(entry))
+        pipe.ltrim(_ledger_key(user_id), 0, 999)
+        pipe.set(idk, json.dumps(resp), ex=60 * 60 * 24 * 7)
+        await pipe.execute()
+
+    return resp
