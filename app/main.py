@@ -7,11 +7,13 @@ import time
 import uuid
 from typing import Any, Dict, Optional, Tuple, List, Iterable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body, Query
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.redis_client import redis_client, close_redis
+
 
 
 
@@ -217,9 +219,11 @@ DEFAULT_RESOURCES = {"gold": 500.0, "wood": 300.0}
 # =============================================================================
 # Pydantic requests
 # =============================================================================
+class SetRadiusRequest(BaseModel):
+    radius: int
+
 class UpgradeRequest(BaseModel):
     building_id: str
-
 
 class PlaceRequest(BaseModel):
     building_type: str
@@ -1141,6 +1145,11 @@ async def dev_grant(req: Request, user_id: str, body: DevGrantRequest):
         "server_time": now,
     }
 
+# Alias for convenience / backwards-compat in scripts:
+@app.post("/dev/resources/{user_id}")
+async def dev_resources_alias(req: Request, user_id: str, body: DevGrantRequest = Body(...)):
+    # reuse the same implementation as /dev/grant
+    return await dev_grant(req=req, user_id=user_id, body=body)
 
 @app.post("/dev/wipe/{user_id}")
 async def dev_wipe(req: Request, user_id: str):
@@ -1159,26 +1168,38 @@ async def dev_wipe(req: Request, user_id: str):
     log.info(f"rid={req.state.rid} DEV wipe user_id={user_id}")
     return {"status": "ok", "message": "Wiped", "user_id": user_id, "server_time": now}
 
-
 @app.post("/dev/world/set_radius/{user_id}")
-async def dev_set_world_radius(req: Request, user_id: str, radius: int):
-    """
-    DEV: Set world radius directly.
-    """
-    _require_dev()
+async def dev_world_set_radius(
+    req: Request,
+    user_id: str,
+    body: Optional[SetRadiusRequest] = Body(default=None),
+    radius: Optional[int] = Query(default=None),
+):
+    if not ALLOW_DEV_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
     now = time.time()
 
-    if radius < 0:
+    # Accept both JSON body and query param
+    r = None
+    if body is not None:
+        r = body.radius
+    if r is None:
+        r = radius
+
+    if r is None:
+        raise HTTPException(status_code=422, detail="radius is required (use JSON body or ?radius=...)")
+
+    if r < 0:
         raise HTTPException(status_code=400, detail="radius must be >= 0")
-    if radius > 2000:
+    if r > 2000:
         raise HTTPException(status_code=400, detail="radius too large")
 
     async with UserLock(user_id):
         world = await _load_world(user_id)
-        world["radius"] = int(radius)
+        world["radius"] = int(r)
         world["updated_at"] = now
         await redis_client.set(_world_key(user_id), json.dumps(world))
 
-    log.info(f"rid={req.state.rid} DEV set_radius user_id={user_id} radius={radius}")
+    log.info(f"rid={req.state.rid} DEV set_radius user_id={user_id} radius={r}")
     return {"status": "ok", "user_id": user_id, "world": world, "server_time": now}
-
