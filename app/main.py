@@ -662,7 +662,7 @@ async def get_city(req: Request, user_id: str):
 
     city_id = get_city_id_for_user(user_id)
 
-    player_key = _player_key(city_id)
+    player_key = _player_key(user_id)
     city_key = _city_key(city_id)
     world_key = _world_key(city_id)
 
@@ -778,10 +778,12 @@ async def upgrade_building(req: Request, user_id: str, request: UpgradeRequest):
       - store back
     """
     now = time.time()
+    city_id = get_city_id_for_user(user_id)
+
     building_id = request.building_id
 
     player_key = _player_key(user_id)
-    city_key = _city_key(user_id)
+    city_key = _city_key(city_id)
 
     async with UserLock(user_id):
         buildings_raw = await redis_client.get(city_key)
@@ -869,6 +871,8 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
       - store back
     """
     now = time.time()
+    city_id = get_city_id_for_user(user_id)
+
     building_type = request.building_type
     x = int(request.x)
     y = int(request.y)
@@ -881,7 +885,7 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
     # bounds are handled by world radius
 
     player_key = _player_key(user_id)
-    city_key = _city_key(user_id)
+    city_key = _city_key(city_id)
 
     async with UserLock(user_id):
         buildings_raw = await redis_client.get(city_key)
@@ -891,7 +895,7 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
             raise HTTPException(status_code=404, detail="Player not found")
 
         # === NEW: load world (radius)
-        world = await _load_world(user_id)
+        world = await _load_world(city_id)
 
         # world bounds check (including footprint)
         if not _footprint_fits_world(x, y, building_type, world, rotation):
