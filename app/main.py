@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from app.redis_client import redis_client, close_redis
 
 from typing import Literal
-
+from app.services.city import get_city_id_for_user, can_modify_city
 
 # -----------------------------------------------------------------------------
 # Logging (readable + request-id)
@@ -618,6 +618,8 @@ async def new_game(req: Request, body: NewGameRequest):
     user_id = body.user_id or f"u_{uuid.uuid4().hex[:10]}"
     now = time.time()
 
+    city_id = get_city_id_for_user(user_id)
+
     async with UserLock(user_id):
         player_key = _player_key(user_id)
         city_key = _city_key(user_id)
@@ -657,16 +659,19 @@ async def get_city(req: Request, user_id: str):
     Everything under per-user lock to avoid races.
     """
     now = time.time()
-    player_key = _player_key(user_id)
-    city_key = _city_key(user_id)
-    world_key = _world_key(user_id)
+
+    city_id = get_city_id_for_user(user_id)
+
+    player_key = _player_key(city_id)
+    city_key = _city_key(city_id)
+    world_key = _world_key(city_id)
 
     async with UserLock(user_id):
         resources_raw = await redis_client.hgetall(player_key)
         buildings_raw = await redis_client.get(city_key)
 
         # === NEW: world load/ensure
-        world = await _load_world(user_id)
+        world = await _load_world(city_id)
         radius = int(world.get("radius") or DEFAULT_WORLD_RADIUS)
 
         created = False
