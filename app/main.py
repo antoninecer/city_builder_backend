@@ -979,10 +979,13 @@ async def demolish_building(req: Request, user_id: str, request: DemolishRequest
       - store back
     """
     now = time.time()
+
+    city_id = get_city_id_for_user(user_id)
+
     building_id = request.building_id
 
     player_key = _player_key(user_id)
-    city_key = _city_key(user_id)
+    city_key = _city_key(city_id)
 
     async with UserLock(user_id):
         buildings_raw = await redis_client.get(city_key)
