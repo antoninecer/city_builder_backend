@@ -1086,6 +1086,9 @@ async def expand_world(req: Request, user_id: str, body: ExpandRequest):
     This is the backend primitive you can later bind to payments/gems.
     """
     now = time.time()
+
+    city_id = get_city_id_for_user(user_id)
+
     steps = int(body.steps or 1)
     if steps < 1:
         steps = 1
@@ -1093,14 +1096,14 @@ async def expand_world(req: Request, user_id: str, body: ExpandRequest):
         raise HTTPException(status_code=400, detail="Too many steps")
 
     player_key = _player_key(user_id)
-    world_key = _world_key(user_id)
+    world_key = _world_key(city_id)
 
     async with UserLock(user_id):
         resources_raw = await redis_client.hgetall(player_key)
         if not resources_raw:
             raise HTTPException(status_code=404, detail="Player not found")
 
-        world = await _load_world(user_id)
+        world = await _load_world(city_id)
         r = int(world.get("radius") or DEFAULT_WORLD_RADIUS)
 
         resources = {
@@ -1373,6 +1376,9 @@ async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest)
         raise HTTPException(status_code=404, detail="Not Found")
 
     now = time.time()
+
+    city_id = get_city_id_for_user(user_id)
+
     steps = int(body.steps or 1)
     if steps < 1:
         steps = 1
@@ -1384,7 +1390,7 @@ async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest)
         raise HTTPException(400, "Idempotency-Key header is required")
 
     player_key = _player_key(user_id)
-    world_key = _world_key(user_id)
+    world_key = _world_key(city_id)
 
     async with UserLock(user_id):
         # idempotency check
@@ -1402,7 +1408,7 @@ async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest)
         if not resources_raw:
             raise HTTPException(status_code=404, detail="Player not found")
 
-        world = await _load_world(user_id)
+        world = await _load_world(city_id)
         r = int(world.get("radius") or DEFAULT_WORLD_RADIUS)
 
         cur_gems = _safe_int(resources_raw.get("gems"), 0)
@@ -1451,13 +1457,14 @@ async def speedup_upgrade(req: Request, user_id: str, body: SpeedupUpgradeReques
         raise HTTPException(status_code=404, detail="Not Found")
 
     now = time.time()
+    city_id = get_city_id_for_user(user_id)
 
     idem = (req.headers.get("Idempotency-Key") or "").strip()
     if not idem:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
 
     player_key = _player_key(user_id)
-    city_key = _city_key(user_id)
+    city_key = _city_key(city_id)
 
     async with UserLock(user_id):
         # idempotency
