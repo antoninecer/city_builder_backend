@@ -16,7 +16,14 @@ from pydantic import BaseModel
 from app.redis_client import redis_client, close_redis
 
 from typing import Literal
-from app.services.city import get_city_id_for_user, can_modify_city
+
+from app.services.city import (
+    get_city_id_for_user,
+    can_modify_city,
+    create_invite,
+    accept_invite,
+)
+
 
 # -----------------------------------------------------------------------------
 # Logging (readable + request-id)
@@ -308,7 +315,16 @@ class DemolishRequest(BaseModel):
 class NewGameRequest(BaseModel):
     user_id: Optional[str] = None
 
+class InviteRequest(BaseModel):
+    role: str = "editor"   # editor | viewer
 
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+    user_id: str
+
+
+# =============================================================================
 # === DEV: grant resources (add or set) ======================================
 class DevGrantRequest(BaseModel):
     gold: Optional[float] = None
@@ -345,14 +361,11 @@ def _safe_int(v: Any, default: int = 0) -> int:
 def _player_key(user_id: str) -> str:
     return f"player:{user_id}"
 
+def _city_key(city_id: str) -> str:
+    return f"city:{city_id}:buildings"
 
-def _city_key(user_id: str) -> str:
-    return f"city:{user_id}:buildings"
-
-
-def _world_key(user_id: str) -> str:
-    return f"city:{user_id}:world"
-
+def _world_key(city_id: str) -> str:
+    return f"city:{city_id}:world"
 
 def _default_world() -> Dict[str, Any]:
     # radius=3 => coords -3..+3 => 7x7
@@ -364,11 +377,11 @@ def _default_world() -> Dict[str, Any]:
     }
 
 
-async def _load_world(user_id: str) -> Dict[str, Any]:
-    raw = await redis_client.get(_world_key(user_id))
+async def _load_world(city_id: str) -> Dict[str, Any]:
+    raw = await redis_client.get(_world_key(city_id))
     if not raw:
         w = _default_world()
-        await redis_client.set(_world_key(user_id), json.dumps(w))
+        await redis_client.set(_world_key(city_id), json.dumps(w))
         return w
     try:
         w = json.loads(raw)
@@ -376,7 +389,7 @@ async def _load_world(user_id: str) -> Dict[str, Any]:
             raise ValueError("world not dict")
     except Exception:
         w = _default_world()
-        await redis_client.set(_world_key(user_id), json.dumps(w))
+        await redis_client.set(_world_key(city_id), json.dumps(w))
         return w
 
     # normalize
@@ -618,12 +631,13 @@ async def new_game(req: Request, body: NewGameRequest):
     user_id = body.user_id or f"u_{uuid.uuid4().hex[:10]}"
     now = time.time()
 
-    city_id = get_city_id_for_user(user_id)
-
+    # initialize city + membership
+    city_id = await get_city_id_for_user(user_id)
+    
     async with UserLock(user_id):
         player_key = _player_key(user_id)
-        city_key = _city_key(user_id)
-        world_key = _world_key(user_id)
+        city_key = _city_key(city_id)
+        world_key = _world_key(city_id)
 
         exists_player = await redis_client.exists(player_key)
         exists_city = await redis_client.exists(city_key)
@@ -660,7 +674,7 @@ async def get_city(req: Request, user_id: str):
     """
     now = time.time()
 
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
 
     player_key = _player_key(user_id)
     city_key = _city_key(city_id)
@@ -778,7 +792,9 @@ async def upgrade_building(req: Request, user_id: str, request: UpgradeRequest):
       - store back
     """
     now = time.time()
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
 
     building_id = request.building_id
 
@@ -871,7 +887,9 @@ async def place_building(req: Request, user_id: str, request: PlaceRequest):
       - store back
     """
     now = time.time()
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
 
     building_type = request.building_type
     x = int(request.x)
@@ -980,7 +998,10 @@ async def demolish_building(req: Request, user_id: str, request: DemolishRequest
     """
     now = time.time()
 
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
+
 
     building_id = request.building_id
 
@@ -1087,7 +1108,9 @@ async def expand_world(req: Request, user_id: str, body: ExpandRequest):
     """
     now = time.time()
 
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
 
     steps = int(body.steps or 1)
     if steps < 1:
@@ -1202,6 +1225,48 @@ async def shop_credit_gems(req: Request, body: CreditGemsRequest):
 
     return resp
 
+
+# =============================================================================
+# === MULTIPLAYER / INVITES ===================================================
+# =============================================================================
+
+@app.post("/city/{user_id}/invite")
+async def create_city_invite(req: Request, user_id: str, body: InviteRequest):
+    """
+    Owner (or editor) creates an invite to their city.
+    Returns a one-time invite token.
+    """
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
+
+    try:
+        token = await create_invite(city_id, user_id, body.role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "city_id": city_id,
+        "invite_token": token,
+        "role": body.role,
+    }
+
+@app.post("/invite/accept")
+async def accept_city_invite(req: Request, body: AcceptInviteRequest):
+    """
+    Join a city using an invite token.
+    """
+    try:
+        city_id = await accept_invite(body.token, body.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "status": "ok",
+        "user_id": body.user_id,
+        "city_id": city_id,
+    }
+
 # =============================================================================
 # === DEV ENDPOINTS ===========================================================
 # =============================================================================
@@ -1220,12 +1285,12 @@ async def dev_reset(req: Request, user_id: str, body: DevResetRequest):
     """
     _require_dev()
     now = time.time()
+    city_id = await get_city_id_for_user(user_id)
 
     async with UserLock(user_id):
         player_key = _player_key(user_id)
-        city_key = _city_key(user_id)
-        world_key = _world_key(user_id)
-
+        city_key = _city_key(city_id)
+        world_key = _world_key(city_id) 
         if body.wipe:
             await redis_client.delete(player_key)
             await redis_client.delete(city_key)
@@ -1361,11 +1426,13 @@ async def dev_world_set_radius(
     if r > 2000:
         raise HTTPException(status_code=400, detail="radius too large")
 
+    city_id = await get_city_id_for_user(user_id)
+
     async with UserLock(user_id):
-        world = await _load_world(user_id)
+        world = await _load_world(city_id)
         world["radius"] = int(r)
         world["updated_at"] = now
-        await redis_client.set(_world_key(user_id), json.dumps(world))
+        await redis_client.set(_world_key(city_id), json.dumps(world))
 
     log.info(f"rid={req.state.rid} DEV set_radius user_id={user_id} radius={r}")
     return {"status": "ok", "user_id": user_id, "world": world, "server_time": now}
@@ -1377,7 +1444,10 @@ async def expand_world_gems(req: Request, user_id: str, body: ExpandGemsRequest)
 
     now = time.time()
 
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
+
 
     steps = int(body.steps or 1)
     if steps < 1:
@@ -1457,7 +1527,10 @@ async def speedup_upgrade(req: Request, user_id: str, body: SpeedupUpgradeReques
         raise HTTPException(status_code=404, detail="Not Found")
 
     now = time.time()
-    city_id = get_city_id_for_user(user_id)
+    city_id = await get_city_id_for_user(user_id)
+    if not await can_modify_city(user_id, city_id):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this city")
+
 
     idem = (req.headers.get("Idempotency-Key") or "").strip()
     if not idem:
