@@ -338,3 +338,164 @@ Summary
 Backend is ready.
 Next step is not fixing bugs —
 it is teaching the backend who is allowed to act.
+
+🧱 BACKEND TODO – architektura budov (future-proof)
+🎯 Cíl
+
+oddělit doménu „budovy“ z main.py
+
+umožnit:
+
+snadné přidávání nových budov
+
+různé footprinty
+
+různé produkce / upgrady
+
+zabránit dalšímu bobtnání main.py
+
+📁 Navržená struktura
+app/
+├── main.py                  # jen API + orchestrace
+├── services/
+│   ├── city.py               # města, membership, invites
+│   ├── buildings.py          # 👈 VŠE kolem budov
+│   ├── world.py              # (později) radius, expand, bounds
+│   └── economy.py            # (později) produkce, balance
+
+
+Pravidlo:
+
+main.py NESMÍ znát konkrétní budovy ani jejich config.
+
+🧠 Co patří do services/buildings.py
+1️⃣ Building registry (jediný zdroj pravdy)
+BUILDING_CONFIG = {
+  "farm": {...},
+  "lumbermill": {...},
+}
+
+
+typ
+
+max_level
+
+footprint {w,h}
+
+rotatable
+
+upgrade_cost
+
+upgrade_duration
+
+production_xxx
+
+👉 main.py NESMÍ mít BUILDING_CONFIG
+
+2️⃣ Public API (funkce, které main.py smí volat)
+get_building_config(type)
+get_footprint(type)
+get_build_cost(type)
+get_upgrade_cost(type, level)
+get_upgrade_duration(type, level)
+get_production(building)
+
+
+Main se ptá:
+
+„kolik stojí upgrade?“
+ne:
+„cfg[‘farm’][…]“
+
+3️⃣ Footprint logika (už tam skoro je – jen přesunout)
+tiles_for_footprint(x, y, type, rotation)
+footprint_fits_world(...)
+footprint_collides(...)
+
+
+➡️ žádná footprint logika v main.py
+
+4️⃣ Normalizace budovy (MIGRACE)
+normalize_building(bid, raw)
+normalize_buildings(dict)
+
+
+doplní:
+
+level
+
+footprint
+
+rotation
+
+zpětná kompatibilita
+
+🏗️ Jak správně PŘIDAT NOVOU BUDOVU (checklist)
+✅ Krok 1 – přidat config
+BUILDING_CONFIG["market"] = {
+  "max_level": 5,
+  "footprint": {"w": 2, "h": 2},
+  "rotatable": True,
+  "upgrade_cost_gold": [...],
+  "upgrade_duration": [...],
+}
+
+
+❌ NIC jiného se zatím nemění
+
+✅ Krok 2 – produkce (pokud má)
+
+buď:
+
+gold / wood
+
+nebo speciální efekt (později)
+
+➡️ get_production(building) musí umět nový typ
+
+✅ Krok 3 – frontend dostane automaticky:
+
+footprint
+
+max_level
+
+build_cost
+
+(přes /city → catalog)
+
+🚫 Co se NESMÍ stát
+
+❌ přidat budovu úpravou 5 endpointů
+
+❌ psát if b_type == "farm" v main.py
+
+❌ duplicita cost výpočtů
+
+🔮 Co už je připravené (a je to dobře)
+
+✔ footprint support
+✔ negative coords
+✔ world bounds
+✔ upgrade timers
+✔ speedup logic
+✔ catalog endpoint
+
+To znamená:
+
+backend je už teď připravený na 2×2, 3×2, rotace i DLC budovy
+
+📌 Doporučení do README (jedna věta)
+
+All building definitions and logic live in services/buildings.py.
+main.py must never reference building internals directly.
+
+🧭 Co bych dělal jako další backend krok (až po UX)
+
+vyříznout:
+
+BUILDING_CONFIG
+
+footprint helpers
+
+production calc
+z main.py → services/buildings.py
